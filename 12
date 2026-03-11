@@ -1,0 +1,403 @@
+#!/usr/bin/env python3
+"""
+This scripts is a bioinformatics tool mimicing the Ensemble vep formatting output. 
+This tool is designed to compare two DNA genotype input files from different sources 
+(e.g., 23andMe, AncestryDNA). It calculates the total raw markers for both files, 
+identifies overlapping shared markers, and analyze genotype similarity. Additionally, 
+it performs functional annotation via API searches to classify SNPs as harmless (synonymous) 
+or serious (missense)
+1. Data Standardization: 
+   Supports raw DNA data from various providers (23andMe, AncestryDNA, etc.).
+   Automatically detects and merges 'allele1/allele2' formats into standard genotypes.
+   Deduplicate and merge raw files.
+   Generate chromosome encoding matching map (e.g., 23/24/25 from 23andMe 
+   or X/Y/MT from AncestryDNA) into standardized encoding (e.g.Autosomes, X, Y, and MT).
+2. Biological Alignment:
+   Handles unphased genotypes (e.g., GA and AG) by sorting genotype alphabetically.
+   Detects and reports technical artifacts using biological complement rules. Expands hemizygous 
+   calls in sex chromosome (e.g., 'A') into homozygous format ('AA') to allow accurate comparison with 
+   diploid samples.
+3. Functional Annotation:
+   Conducts API searches to classify SNPs across functional annotation (e.g., missense, 
+   synonymous, intronic, UTR).Maps population-scale allele frequency (AF) to identify as harmless or serious
+4. Output
+   Generates PDF reports titled by the specific comparison (file1_vs_file2).
+   Includes visualizations: Data tables and Functional pie charts.
+   Annotated SNP mismatch table prioritizes functionally significant mismatches 
+   by cross-referencing variant impact with population-scale allele frequencies, 
+   providing HGVS protein (p.) and codon (c.) alterations(if any).
+5. Genomic Signature Detection (ROH):
+   Uses a vectorized sliding window (default: 50 SNPs) to calculate Runs of Homozygosity (ROH)
+   with a step size of 1 SNP.   
+Environment Setup:
+Runtime: Python 3.12+
+Main Libraries: pandas, matplotlib, fpdf2, requests
+Data Source: MyVariant.info API (Internet access required)
+Usage
+It is recommended to run this script within an activated virtual environment (venv).
+Command: source .venv/bin/activate && python3 scripts/datParser.py <file1> <file2>
+"""
+import sys
+# Handling command-line arguments
+import os
+# Handling file systematics path and dynamically extract file name(os.path.basename)
+import requests
+#Querying genomic annotations via the MyVariant.info API
+import time
+#Tracking runtime and calculate Estimated Time of Arrival (ETA)
+import pandas as pd
+# Main high-performance tool for data manipulation and analysis
+import numpy as np
+# Used for mathematical operations and handling missing genomic data
+import matplotlib.pyplot as plt
+# Generating visual charts like the functional annotation pie chart
+from fpdf import FPDF
+# Generating and formatting pdf report
+from fpdf.enums import XPos,YPos 
+# Formatting cursor position
+# Define the global translation table
+COMPLEMENT_TABLE = str.maketrans("ATCG", "TAGC")
+# Custom pdf class for header automatic generation
+class FinalReport(FPDF):
+    def __init__(self, title_text):
+        # Initialize the parent FPDF class to inherit all standard PDF generation methods
+        super().__init__()
+        self.title_text = title_text
+        # Store the dynamically generated comparison title as an instance variable for use in headers
+        self.set_auto_page_break(auto=True, margin=15)      
+        # Enable automatic page breaks with a 15mm bottom margin
+    def header(self):
+        # Set font for the header and center the comparison title
+        self.set_font('helvetica', 'B', 14)
+        # 'new_x=XPos.LMARGIN' and 'new_y=YPos.NEXT' are the used to reset the 
+        # cursor to the left margin on the next line immediately after the cell is filled.
+        # The text title has a height of 10 units
+        self.cell(0, 10, self.title_text, align='C', new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+        # Move the cursor for extra 5 units
+        self.ln(5)
+# Helper functions for data analysis
+# This function is used to load and standardize raw data
+def load_genotype(path):
+    try:
+        print(f"Loading and cleaning raw data: {os.path.basename(path)}...", flush=True)
+        # Find first line with rsid, skip all comment lines before(e.g. for 23andME)
+        firstrsid = 0
+        with open(path, 'r', encoding='utf-8', errors='ignore') as f:
+            for rownum, rowcont in enumerate(f):
+                # If find the first row with rsid, stop iteration
+                if any(curr_id in rowcont.lower() for curr_id in ['rsid', 'name', 'snp']): 
+                   firstrsid = rownum
+                   break
+        # sep="None" used to automatically detect deliminator, skip comment rows until first rsid
+        df = pd.read_csv(path, sep=None, skiprows=firstrsid, engine='python', dtype=str)
+        # Count initial total entries
+        raw_rows = len(df)
+        # Standardize column names with lowercase, removing "#" and whitespaces
+        df.columns = [str(colid).replace("#", "").strip().lower() for colid in df.columns]
+        # Convert possible ids and genotype from different providers（e.g. AncestryDNA, MyHeritage, Living DNA,WeGene into rsid and genotype
+        # Initiate a list with 4 tuples for mapping
+        for name_before, name_stand in [('name','rsid'),('snp','rsid'),('result','genotype'),('call','genotype')]:
+            if name_before in df.columns: 
+                df = df.rename(columns={name_before: name_stand})
+        # If genotype column is appeared in two columns with allele1 and allele2, merge together, NaN value fill with "-"
+        if 'genotype' not in df.columns and 'allele1' in df.columns:
+            df['genotype'] = df['allele1'].fillna('-') + df['allele2'].fillna('-')
+        # function for fixxing hemizygosity(sex chromosome,mtdna) to pseudo-diploid
+        def fix_chro(g):
+            g = str(g).replace(' ','').replace('0','-').replace('?','-')
+            if len(g) == 1 and g != '-': 
+                return g + g
+            return "".join(sorted(list(g)))
+        # apply the hemizygosity fix function
+        df['genotype'] = df['genotype'].apply(fix_chro)
+        # Chromosome mapping for different sources getnomic data (23andMe, MyHeritage, AncestryDNA, etc.)
+        c_map = {
+            '23': 'X', '24': 'Y', '25': 'MT', '26': 'PAR', 
+            'M': 'MT', 'MT': 'MT', 'CHRM': 'MT', 'XY': 'PAR', '0': 'MT'
+        }
+        # remove CHR prefix and convert chromosome types to upper cases
+        df['chromosome'] = df['chromosome'].astype(str).str.upper().str.replace('CHR','')
+        # if can not map with labels above, just fill with the original type value
+        df['chromosome'] = df['chromosome'].map(c_map).fillna(df['chromosome'])
+        # Convert the 'position' column to numeric type
+        df['position'] = pd.to_numeric(df['position'], errors='coerce')       
+        # Count missing entries 
+        miss_count = df['genotype'].isin(['--', '??', '-', '00']).sum()
+        # Count duplicate entries
+        dup_count = df.duplicated('rsid').sum()
+        # Filtering duplications and missing data
+        # Deduplication based on chromosome and position to prevent Cartesian explosion during merge
+        df_clean = df.dropna(subset=['chromosome', 'position']).drop_duplicates(['chromosome', 'position'])
+        return df_clean, raw_rows, miss_count, dup_count
+    # If there are unexpected errors happening during loading file, print error message and return as below to aviod crash
+    except Exception as e:
+        print(f"Load Error: {e}", flush=True)
+        return None, 0, 0, 0
+
+# This function is used to identify matches and handle strand flips
+def compare_genotypes(df):
+    # Initialize all entries as 'Mismatch' 
+    status = pd.Series("Mismatch", index=df.index)
+    # Identify identical(matching) genotypes (e.g., 'AA' vs 'AA').
+    is_match = df['genotype_f1'] == df['genotype_f2']
+    status[is_match] = "Match"
+    
+    # Isolate entry index that are not direct matches.
+    mismatch_df = df[~is_match].copy()
+    if mismatch_df.empty:
+        return status, 0
+
+    # --- OPTIMIZATION: Replaced .apply(axis=1) with fast Zip-based list comprehension ---
+    def check_flip_fast(geno1, geno2):
+        # Ignore missing data ('-') or single-letter calls to prevent false positives.
+        if '-' in geno1 or '-' in geno2 or len(geno1) != 2 or len(geno2) != 2:
+            return False      
+        # Using global complementary table to translate genotype of file1
+        comp_geno1 = "".join(sorted(list(geno1.translate(COMPLEMENT_TABLE))))
+        return comp_geno1 == geno2
+
+    # Execute check using zip (much faster than apply)
+    flips = [check_flip_fast(g1, g2) for g1, g2 in zip(mismatch_df['genotype_f1'], mismatch_df['genotype_f2'])]
+    
+    # Update the status to 'Flip' for rows that passed the complement check
+    mismatch_df['is_flip'] = flips
+    flip_indices = mismatch_df[mismatch_df['is_flip']].index
+    status.loc[flip_indices] = "Flip"
+    
+    # Return the updated status and sum of fliped strands
+    return status, sum(flips)
+
+# This function used to calculate Runs of Homozygosity based on 50kb window with step 1
+def calculate_roh(df, window=50, min_kb=500):
+    total_kb = 0
+    valid_chrs = [str(i) for i in range(1, 23)]
+    for chrom in df['chromosome'].unique():
+        if chrom not in valid_chrs: continue
+        sub = df[(df['chromosome'] == chrom) & (df['genotype'] != '--')].sort_values('position')
+        if len(sub) < window: continue
+
+        # --- OPTIMIZATION: Used NumPy vectorization for sliding window check ---
+        is_homo = (sub['genotype'].str[0] == sub['genotype'].str[-1]).values.astype(int)
+        
+        # Convolution calculates the sum of 'window' elements at once
+        window_sums = np.convolve(is_homo, np.ones(window, dtype=int), mode='valid')
+        # A hit is where the sum equals the window size (all are homozygous)
+        hit_indices = np.where(window_sums == window)[0]
+        
+        if len(hit_indices) == 0: continue
+
+        hits = []
+        positions = sub['position'].values
+        for idx in hit_indices:
+            hits.append([positions[idx], positions[idx + window - 1]])
+
+        # Merge segments logic (kept as original)
+        merged_segs = []
+        curr_s, curr_e = hits[0]
+        for n_s, n_e in hits[1:]:
+            if n_s <= curr_e: 
+                curr_e = max(curr_e, n_e)
+            else: 
+                merged_segs.append((curr_s, curr_e))
+                curr_s, curr_e = n_s, n_e
+        merged_segs.append((curr_s, curr_e))
+        total_kb += sum((e-s) / 1000 for s, e in merged_segs if (e-s) / 1000 >= min_kb)
+    return total_kb
+
+# Calculates consistency in zygosity calls
+def calculate_zygosity_concordance(df):
+    if len(df) == 0: return 0.0
+    # Use vectorized string slicing
+    g1 = df['genotype_f1'].values.astype(str)
+    g2 = df['genotype_f2'].values.astype(str)
+    is_het_f1 = np.array([s[0] != s[-1] if len(s) > 1 else False for s in g1])
+    is_het_f2 = np.array([s[0] != s[-1] if len(s) > 1 else False for s in g2])
+    return ((is_het_f1 == is_het_f2).sum()/len(df))*100
+
+# This function send API query to extract allele frequency and HGVS from MyVariant.info
+def query_genomic_database(rsid_list):
+    unique_ids = list(set([str(i).strip() for i in rsid_list if str(i).strip().startswith("rs")]))
+    annotation_map = {}
+    session = requests.Session()
+    start_time = time.time()
+    total = len(unique_ids)
+    if total == 0: return {}
+    chunk_size = 1000
+    for i in range(0, total, chunk_size):
+        chunk = unique_ids[i:i + chunk_size]
+        elapsed = time.time() - start_time
+        # Optimized ETA calculation with flush=True
+        if i > 0:
+            avg_per_item = elapsed / i
+            eta_min = (avg_per_item * (total - i)) / 60
+            print(f"API Progress: {i}/{total} | ETA: {eta_min:.1f} min    ", end='\r', flush=True)
+        else:
+            print(f"API Progress: 0/{total} | Initializing...    ", end='\r', flush=True)
+            
+        try:
+            resp = session.post("https://myvariant.info/v1/query", 
+                                data={"q": ",".join(chunk), "scopes": "dbsnp.rsid", 
+                                      "fields": "gnomad_genome.af,snpeff.ann"}, timeout=30)
+            if resp.status_code == 200:
+                data = resp.json()
+                results = data if isinstance(data, list) else data.get('hits', [])
+                for hit in results:
+                    rid = hit.get('query') or hit.get('_id')
+                    af = hit.get('gnomad_genome', {}).get('af', 0.5)
+                    if isinstance(af, dict): af = af.get('af', 0.5)
+                    eff, gene, p_change, c_change = "intergenic", "-", "-", "-"
+                    if 'snpeff' in hit:
+                        ann = hit['snpeff'].get('ann', [])
+                        if isinstance(ann, dict): ann = [ann]
+                        for a in ann:
+                            cur_eff = a.get('effect', '').split('&')[0]
+                            if any(x in cur_eff for x in ['missense', 'stop', 'frame', 'splice']):
+                                eff, gene = cur_eff, a.get('gene_id', '-')
+                                p_change, c_change = a.get('hgvs_p', '-'), a.get('hgvs_c', '-')
+                                break
+                        if eff == "intergenic" and ann:
+                            eff = ann[0].get('effect', '').split('&')[0]
+                            gene = ann[0].get('gene_id', '-')
+                    annotation_map[rid] = {"eff": eff, "af": af, "gene": gene, "p": p_change, "c": c_change}
+        except: pass
+    print(f"\n[INFO] Annotation Complete. Found {len(annotation_map)} annotations.", flush=True)
+    return annotation_map
+
+# Main execution pipeline
+def main():
+    if len(sys.argv) < 3:
+        print("Usage: python3 datParser.py <file1> <file2>")
+        return  
+    f1_path, f2_path = sys.argv[1], sys.argv[2]
+    title_text = f"Genomic Comparison: {os.path.basename(f1_path)} vs {os.path.basename(f2_path)}"    
+    df1, raw1, miss1, dup1 = load_genotype(f1_path)
+    df2, raw2, miss2, dup2 = load_genotype(f2_path)  
+    if df1 is None or df2 is None: return
+
+    # Merge datasets: Adjusted to merge on chromosome and position to improve cross-platform matching
+    print("[2/6] Merging datasets on Chromosome and Position...", flush=True)
+    merged = pd.merge(df1, df2, on=['chromosome', 'position'], suffixes=('_f1', '_f2'))
+    # Prioritize RSID with 'rs' prefix for annotation
+    merged['rsid'] = np.where(merged['rsid_f1'].str.startswith('rs', na=False), merged['rsid_f1'], merged['rsid_f2'])
+    
+    total_snps = len(merged)
+    print(f"[3/6] Comparing {total_snps} overlapping shared markers...", flush=True)
+    merged['status'], flips = compare_genotypes(merged) 
+    
+    print("[4/6] Calculating Genomic Signatures (ROH)...", flush=True)
+    matches = len(merged[merged['status'] == "Match"])
+    mismatches = len(merged[merged['status'] == "Mismatch"])
+    concordance = (matches / total_snps*100) if total_snps > 0 else 0 
+    zyg_concordance = calculate_zygosity_concordance(merged)
+    roh1, roh2 = calculate_roh(df1), calculate_roh(df2)
+
+    # API and Annotation
+    print("[5/6] Starting Functional Annotation via MyVariant.info...", flush=True)
+    mismatch_ids = merged[merged['status'] == "Mismatch"]['rsid'].unique().tolist()
+    annotation_map = query_genomic_database(mismatch_ids)
+    
+    # --- OPTIMIZATION: Efficiently map API results back to dataframe ---
+    if annotation_map:
+        anno_df = pd.DataFrame.from_dict(annotation_map, orient='index').reset_index()
+        anno_df.columns = ['rsid', 'eff', 'af', 'gene', 'p_change', 'c_change']
+        # Merge annotation back into the main dataframe
+        merged = pd.merge(merged, anno_df, on='rsid', how='left')
+        # Fill NaN values for missing annotations
+        merged['eff'] = merged['eff'].fillna('intergenic')
+        merged['af'] = merged['af'].fillna(0.5)
+        merged['gene'] = merged['gene'].fillna('-')
+        merged['p_change'] = merged['p_change'].fillna('-')
+        merged['c_change'] = merged['c_change'].fillna('-')
+    else:
+        # Fallback if API fails
+        for col in ['eff', 'af', 'gene', 'p_change', 'c_change']: merged[col] = '-'
+
+    # Calculate Serious vs Harmless counts based on impact
+    def get_severity(e): return "Serious" if any(x in str(e).lower() for x in ['missense','stop','frame','splice']) else "Harmless"
+    merged['severity'] = merged['eff'].apply(get_severity)
+    serious_n = len(merged[(merged['status'] == "Mismatch") & (merged['severity'] == "Serious")])
+    harmless_n = mismatches - serious_n
+
+    print("[6/6] Generating Visualizations and PDF Report...", flush=True)
+    # Visualization 1: Similarity by Chromosome
+    def cat_chr(c): return c if c in ['X', 'Y', 'MT'] else 'Autosomes'
+    merged['chr_type'] = merged['chromosome'].apply(cat_chr)
+    chr_categories = ['Autosomes', 'X', 'Y', 'MT']
+    sim_data = []
+    for cat in chr_categories:
+        grp = merged[merged['chr_type'] == cat]
+        rate = (len(grp[grp['status'] == 'Match']) / len(grp) * 100) if len(grp) > 0 else 0
+        sim_data.append(rate)
+    
+    plt.figure(figsize=(8, 5))
+    plt.bar(chr_categories, sim_data, color=['#3498db', '#e74c3c', '#2ecc71', '#f1c40f'], edgecolor='black')
+    plt.ylabel("Concordance Rate (%)")
+    plt.title("Genomic Similarity by Chromosome Type")
+    plt.ylim(0, 105)
+    plt.grid(axis='y', linestyle='--', alpha=0.7)
+    plt.savefig("similarity_bar.png", dpi=300)
+    plt.close()
+
+    # Visualization 2: Functional Pie Chart (Removed numbers from wedges)
+    effect_counts = merged[merged['status'] == "Mismatch"]['eff'].value_counts()
+    if not effect_counts.empty:
+        plt.figure(figsize=(10, 8))
+        colors = plt.cm.Set3(np.linspace(0, 1, len(effect_counts))) 
+        # Removed autopct to clear internal numbers and solve unpacking error
+        patches, texts = plt.pie(effect_counts.values, labels=None, colors=colors, startangle=140)
+        plt.title("Genomic Variant Consequences Summary")
+        # Varied legend preserved
+        plt.legend(patches, effect_counts.index, loc="upper center", bbox_to_anchor=(0.5, -0.05), ncol=2, fontsize='small')
+        plt.tight_layout()
+        plt.savefig("functional_summary_pie.png", dpi=300, bbox_inches='tight') 
+        plt.close()
+
+    # Generate pdf report
+    pdf = FinalReport(title_text)  
+    pdf.add_page()
+    pdf.set_font("helvetica", 'B', 12)
+    pdf.cell(0, 10, "1. Executive Summary", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+    with pdf.table(line_height=7, col_widths=(65, 35)) as t:
+        t.row(["Total Overlapped SNPs", f"{total_snps}"])
+        t.row(["Matching Genotypes (Standard)", f"{matches}"])
+        t.row(["Strand Flips Detected", f"{flips}"])
+        t.row(["Mismatching Genotypes", f"{mismatches}"])
+        t.row(["  - [Serious] Impact Mutations", f"{serious_n}"])
+        t.row(["  - [Harmless] Background Variants", f"{harmless_n}"])
+        t.row(["Overall Concordance (%)", f"{concordance:.2f}%"])
+        t.row(["Zygosity Concordance (%)", f"{zyg_concordance:.2f}%"])
+        t.row(["ROH Length F1 / F2 (kb)", f"{roh1:.2f} / {roh2:.2f}"])
+        t.row(["Missing Genotypes (F1 / F2)", f"{miss1} / {miss2}"])
+
+    pdf.ln(5)
+    pdf.image("similarity_bar.png", x=20, w=160)
+    
+    pdf.add_page()
+    if os.path.exists("functional_summary_pie.png"):
+        pdf.image("functional_summary_pie.png", x=30, w=140) 
+        pdf.ln(10)
+
+    pdf.cell(0, 10, "2. Breakdown by Chromosome Group", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+    with pdf.table(line_height=7, col_widths=(50, 50)) as t:
+        t.row(["Category", "Concordance (%)"])
+        for i, cat in enumerate(chr_categories):
+            t.row([cat, f"{sim_data[i]:.2f}%"])
+
+    pdf.ln(10)
+    pdf.cell(0, 10, "3. Top Functional Mismatches (Serious Only)", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+    serious = merged[
+        (merged['status'] == "Mismatch") & 
+        (merged['severity'] == "Serious")
+    ].sort_values('af', ascending=True).head(15)
+    
+    with pdf.table(line_height=7, col_widths=(25, 30, 20, 45, 45)) as t:
+        t.row(["RSID", "Effect", "Gene", "Protein (p.)", "Codon (c.)"])
+        for _, row in serious.iterrows():
+            t.row([str(row['rsid']), str(row['eff']), str(row['gene']), str(row['p_change']), str(row['c_change'])])
+
+    output_name = f"Final_Report_{os.path.basename(f1_path)}_vs_{os.path.basename(f2_path)}.pdf"
+    pdf.output(output_name)
+    print(f"[SUCCESS] Report generated: {output_name}", flush=True)
+
+if __name__ == "__main__":
+    main()
